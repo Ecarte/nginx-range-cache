@@ -1,0 +1,318 @@
+diff -r 4b4aee40c508 src/http/modules/ngx_http_range_filter_module.c
+--- a/src/http/modules/ngx_http_range_filter_module.c	Tue Oct 06 08:57:09 2015 +0300
++++ b/src/http/modules/ngx_http_range_filter_module.c	Thu Oct 08 14:04:05 2015 +0000
+@@ -54,6 +54,7 @@ typedef struct {
+ 
+ typedef struct {
+     off_t        offset;
++    off_t        content_length;
+     ngx_str_t    boundary_header;
+     ngx_array_t  ranges;
+ } ngx_http_range_filter_ctx_t;
+@@ -65,7 +66,8 @@ static ngx_int_t ngx_http_range_singlepa
+     ngx_http_range_filter_ctx_t *ctx);
+ static ngx_int_t ngx_http_range_multipart_header(ngx_http_request_t *r,
+     ngx_http_range_filter_ctx_t *ctx);
+-static ngx_int_t ngx_http_range_not_satisfiable(ngx_http_request_t *r);
++static ngx_int_t ngx_http_range_not_satisfiable(ngx_http_request_t *r,
++    ngx_http_range_filter_ctx_t *ctx);
+ static ngx_int_t ngx_http_range_test_overlapped(ngx_http_request_t *r,
+     ngx_http_range_filter_ctx_t *ctx, ngx_chain_t *in);
+ static ngx_int_t ngx_http_range_singlepart_body(ngx_http_request_t *r,
+@@ -76,6 +78,9 @@ static ngx_int_t ngx_http_range_multipar
+ static ngx_int_t ngx_http_range_header_filter_init(ngx_conf_t *cf);
+ static ngx_int_t ngx_http_range_body_filter_init(ngx_conf_t *cf);
+ 
++static ngx_int_t ngx_http_range_content_range_parse(ngx_http_request_t *r,
++    ngx_http_range_filter_ctx_t *ctx);
++
+ 
+ static ngx_http_module_t  ngx_http_range_header_filter_module_ctx = {
+     NULL,                                  /* preconfiguration */
+@@ -153,8 +158,8 @@ ngx_http_range_header_filter(ngx_http_re
+     ngx_http_range_filter_ctx_t  *ctx;
+ 
+     if (r->http_version < NGX_HTTP_VERSION_10
+-        || r->headers_out.status != NGX_HTTP_OK
+-        || r != r->main
++        || (r->headers_out.status != NGX_HTTP_OK
++            && r->headers_out.status != NGX_HTTP_PARTIAL_CONTENT)
+         || r->headers_out.content_length_n == -1
+         || !r->allow_ranges)
+     {
+@@ -230,9 +235,20 @@ parse:
+ 
+     ranges = r->single_range ? 1 : clcf->max_ranges;
+ 
++    if (ngx_http_range_content_range_parse(r, ctx) != NGX_OK) {
++        goto next_filter;
++    }
++
+     switch (ngx_http_range_parse(r, ctx, ranges)) {
+ 
+     case NGX_OK:
++        if (ctx->ranges.nelts != 1
++            && r->headers_out.status == NGX_HTTP_PARTIAL_CONTENT)
++        {
++            /* Partial content responses not yet supported for multipart. */
++            goto next_filter;
++        }
++
+         ngx_http_set_ctx(r, ctx, ngx_http_range_body_filter_module);
+ 
+         r->headers_out.status = NGX_HTTP_PARTIAL_CONTENT;
+@@ -245,7 +261,7 @@ parse:
+         return ngx_http_range_multipart_header(r, ctx);
+ 
+     case NGX_HTTP_RANGE_NOT_SATISFIABLE:
+-        return ngx_http_range_not_satisfiable(r);
++        return ngx_http_range_not_satisfiable(r, ctx);
+ 
+     case NGX_ERROR:
+         return NGX_ERROR;
+@@ -270,6 +286,108 @@ next_filter:
+ 
+ 
+ static ngx_int_t
++ngx_http_range_content_range_parse(ngx_http_request_t *r,
++    ngx_http_range_filter_ctx_t *ctx)
++{
++    off_t      start, len;
++    u_char     *p;
++
++    ctx->offset = 0;
++    ctx->content_length = r->headers_out.content_length_n;
++
++    if (r->headers_out.status != NGX_HTTP_PARTIAL_CONTENT) {
++        return NGX_OK;
++    }
++
++    if (r->headers_out.content_range == NULL
++        || r->headers_out.content_range->value.len == 0)
++    {
++        if (r->headers_out.content_type.len
++               >= sizeof("multipart/byteranges") - 1
++            && ngx_strncasecmp(r->headers_out.content_type.data,
++                                 (u_char *) "multipart/byteranges", 
++                                 sizeof("multipart/byteranges") - 1)
++              == 0)
++        {
++              /* TODO(steve): support multipart/byteranges. */
++              return NGX_DECLINED;
++        }
++
++        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
++                      "invalid 206 response (missing headers)");
++        return NGX_ERROR;
++    }
++
++    if (r->headers_out.content_range == NULL
++        || r->headers_out.content_range->value.len < sizeof("bytes ")
++        || ngx_strncasecmp(r->headers_out.content_range->value.data,
++                           (u_char *) "bytes ", sizeof("bytes ") - 1) != 0)
++    {
++        /* Only byte ranges are supported. */
++        return NGX_DECLINED;
++    }
++
++    start = 0;
++    len = 0;
++
++    p = r->headers_out.content_range->value.data + 6;
++
++    while (*p == ' ') { p++; }
++
++    if (*p < '0' || *p > '9') {
++        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
++                      "content-range: invalid start %x", *p);
++        return NGX_ERROR;
++    }
++
++    while (*p >= '0' && *p <= '9') {
++        start = start * 10 + *p++ - '0';
++    }
++
++    if (*p++ != '-') {
++        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
++                      "content-range: missing range seperator");
++        return NGX_ERROR;
++    }
++
++    if (*p < '0' || *p > '9') {
++        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
++                      "content-range: invalid end byte %x", *p);
++        return NGX_ERROR;
++    }
++
++    while (*p >= '0' && *p <= '9') { p++; }
++
++    if (*p++ != '/') {
++        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
++                      "content-range: missing len seperator");
++        return NGX_ERROR;
++    }
++
++    if (*p < '0' || *p > '9') {
++        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
++                      "content-range: invalid len byte %x", *p);
++        return NGX_ERROR;
++    }
++
++    while (*p >= '0' && *p <= '9') {
++        len = len * 10 + *p++ - '0';
++    }
++
++    if (*p != '\0') {
++        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
++                      "content-range: missing terminator");
++        return NGX_ERROR;
++    }
++
++    ctx->offset = start;
++    ctx->content_length = len;
++
++    return NGX_OK;
++}
++
++
++static ngx_int_t
+ ngx_http_range_parse(ngx_http_request_t *r, ngx_http_range_filter_ctx_t *ctx,
+     ngx_uint_t ranges)
+ {
+@@ -280,7 +398,7 @@ ngx_http_range_parse(ngx_http_request_t 
+ 
+     p = r->headers_in.range->value.data + 6;
+     size = 0;
+-    content_length = r->headers_out.content_length_n;
++    content_length = ctx->content_length;
+ 
+     cutoff = NGX_MAX_OFF_T_VALUE / 10;
+     cutlim = NGX_MAX_OFF_T_VALUE % 10;
+@@ -305,6 +423,12 @@ ngx_http_range_parse(ngx_http_request_t 
+                 start = start * 10 + *p++ - '0';
+             }
+ 
++            if (start < ctx->offset) {
++                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
++                              "range: start < offset");
++                return NGX_ERROR;
++            }
++
+             while (*p == ' ') { p++; }
+ 
+             if (*p++ != '-') {
+@@ -400,6 +524,11 @@ ngx_http_range_singlepart_header(ngx_htt
+         return NGX_ERROR;
+     }
+ 
++    /* Clear out any existing range. */
++    if (r->headers_out.content_range != NULL) {
++        r->headers_out.content_range->hash = 0;
++    }
++
+     r->headers_out.content_range = content_range;
+ 
+     content_range->hash = 1;
+@@ -418,7 +547,7 @@ ngx_http_range_singlepart_header(ngx_htt
+     content_range->value.len = ngx_sprintf(content_range->value.data,
+                                            "bytes %O-%O/%O",
+                                            range->start, range->end - 1,
+-                                           r->headers_out.content_length_n)
++                                           ctx->content_length)
+                                - content_range->value.data;
+ 
+     r->headers_out.content_length_n = range->end - range->start;
+@@ -557,7 +686,8 @@ ngx_http_range_multipart_header(ngx_http
+ 
+ 
+ static ngx_int_t
+-ngx_http_range_not_satisfiable(ngx_http_request_t *r)
++ngx_http_range_not_satisfiable(ngx_http_request_t *r,
++    ngx_http_range_filter_ctx_t *ctx)
+ {
+     ngx_table_elt_t  *content_range;
+ 
+@@ -568,6 +698,11 @@ ngx_http_range_not_satisfiable(ngx_http_
+         return NGX_ERROR;
+     }
+ 
++    /* Clear out any existing range. */
++    if (r->headers_out.content_range != NULL) {
++        r->headers_out.content_range->hash = 0;
++    }
++
+     r->headers_out.content_range = content_range;
+ 
+     content_range->hash = 1;
+@@ -581,7 +716,7 @@ ngx_http_range_not_satisfiable(ngx_http_
+ 
+     content_range->value.len = ngx_sprintf(content_range->value.data,
+                                            "bytes */%O",
+-                                           r->headers_out.content_length_n)
++                                           ctx->content_length)
+                                - content_range->value.data;
+ 
+     ngx_http_clear_content_length(r);
+diff -r 4b4aee40c508 src/http/ngx_http_upstream.c
+--- a/src/http/ngx_http_upstream.c	Tue Oct 06 08:57:09 2015 +0300
++++ b/src/http/ngx_http_upstream.c	Thu Oct 08 14:04:05 2015 +0000
+@@ -138,6 +138,8 @@ static ngx_int_t ngx_http_upstream_rewri
+     ngx_table_elt_t *h, ngx_uint_t offset);
+ static ngx_int_t ngx_http_upstream_copy_allow_ranges(ngx_http_request_t *r,
+     ngx_table_elt_t *h, ngx_uint_t offset);
++static ngx_int_t ngx_http_upstream_copy_content_range(ngx_http_request_t *r,
++    ngx_table_elt_t *h, ngx_uint_t offset);
+ 
+ #if (NGX_HTTP_GZIP)
+ static ngx_int_t ngx_http_upstream_copy_content_encoding(ngx_http_request_t *r,
+@@ -250,6 +252,11 @@ ngx_http_upstream_header_t  ngx_http_ups
+                  ngx_http_upstream_copy_allow_ranges,
+                  offsetof(ngx_http_headers_out_t, accept_ranges), 1 },
+ 
++    { ngx_string("Content-Range"),
++                 ngx_http_upstream_ignore_header_line, 0,
++                 ngx_http_upstream_copy_content_range,
++                 offsetof(ngx_http_headers_out_t, content_range), 1 },
++
+     { ngx_string("Connection"),
+                  ngx_http_upstream_process_connection, 0,
+                  ngx_http_upstream_ignore_header_line, 0, 0 },
+@@ -4809,6 +4816,38 @@ ngx_http_upstream_copy_allow_ranges(ngx_
+ }
+ 
+ 
++static ngx_int_t
++ngx_http_upstream_copy_content_range(ngx_http_request_t *r,
++    ngx_table_elt_t *h, ngx_uint_t offset)
++{
++    ngx_table_elt_t  *ho;
++
++#if (NGX_HTTP_CACHE)
++
++    if (r->cached) {
++        r->allow_ranges = 1;
++    }
++
++    if (r->upstream->cacheable) {
++        r->allow_ranges = 1;
++        r->single_range = 1;
++    }
++
++#endif
++
++    ho = ngx_list_push(&r->headers_out.headers);
++    if (ho == NULL) {
++        return NGX_ERROR;
++    }
++
++    *ho = *h;
++
++    r->headers_out.content_range = ho;
++
++    return NGX_OK;
++}
++
++
+ #if (NGX_HTTP_GZIP)
+ 
+ static ngx_int_t

@@ -1,4 +1,4 @@
-# nginx-range-cache
+# Nginx Range Cache Module
 This nginx module provides fixed boundary range requests to request large files
 as well as remapping random range requests to fixed ones providing effective
 caching in nginx.

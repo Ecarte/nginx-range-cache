@@ -29,17 +29,6 @@ diff -r 4b4aee40c508 src/http/modules/ngx_http_range_filter_module.c
  
  static ngx_http_module_t  ngx_http_range_header_filter_module_ctx = {
      NULL,                                  /* preconfiguration */
-@@ -153,8 +158,8 @@ ngx_http_range_header_filter(ngx_http_re
-     ngx_http_range_filter_ctx_t  *ctx;
- 
-     if (r->http_version < NGX_HTTP_VERSION_10
--        || r->headers_out.status != NGX_HTTP_OK
--        || r != r->main
-+        || (r->headers_out.status != NGX_HTTP_OK
-+            && r->headers_out.status != NGX_HTTP_PARTIAL_CONTENT)
-         || r->headers_out.content_length_n == -1
-         || !r->allow_ranges)
-     {
 @@ -230,9 +235,20 @@ parse:
  
      ranges = r->single_range ? 1 : clcf->max_ranges;

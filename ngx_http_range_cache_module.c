@@ -195,8 +195,10 @@ ngx_http_range_cache_header_filter(ngx_http_request_t *r)
         range = ctx->ranges.elts;
         start = range->start;
     } else {
-      start = ctx->range.start;
+        start = ctx->range.start;
     }
+
+    r->subrequest_ranges = 1;
 
     // "Content-Range: bytes SSSS-EEEE/TTTT" header
     content_range->value.len = ngx_sprintf(content_range->value.data,
